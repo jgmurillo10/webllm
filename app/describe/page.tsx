@@ -1,73 +1,172 @@
 "use client";
 
-import { useState, useEffect } from "react";
-import * as webllm from "@mlc-ai/web-llm";
+import { useState, useEffect, useRef } from "react";
+import Link from "next/link";
+
+interface MessageContent {
+  type: "text" | "image";
+  text?: string;
+  image?: string;
+}
+
+interface Message {
+  role: "user" | "assistant";
+  content: MessageContent[];
+}
+
+type ProgressItem = {
+  file: string;
+  progress: number;
+  loaded?: number;
+  total?: number;
+};
 
 export default function DescribePage() {
-  const [engine, setEngine] = useState<webllm.MLCEngine | null>(null);
-  const [isLoading, setIsLoading] = useState(false);
-  const [progress, setProgress] = useState("");
-  const [selectedImage, setSelectedImage] = useState<string | null>(null);
-  const [description, setDescription] = useState("");
-  const [isDescribing, setIsDescribing] = useState(false);
-  const [prompt, setPrompt] = useState("Describe this image in detail.");
-  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const worker = useRef<Worker | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Check available models on mount
+  const [gpuSupported, setGpuSupported] = useState<boolean | null>(null);
+  const [status, setStatus] = useState<null | "loading" | "ready">(null);
+  const [error, setError] = useState<null | string>(null);
+  const [loadingMessage, setLoadingMessage] = useState("");
+  const [progressItems, setProgressItems] = useState<ProgressItem[]>([]);
+
+  const [selectedImage, setSelectedImage] = useState<string | null>(null);
+  const [inputText, setInputText] = useState("");
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [isThinking, setIsThinking] = useState(false);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [tps, setTps] = useState<number | null>(null);
+  const [numTokens, setNumTokens] = useState<number | null>(null);
+
+  // Predefined image URLs
+  const predefinedImages = [
+    "https://media.elgourmet.com/recetas/cover/97dee7a5ee5095b05cfaf66b516eaa67_3_3_photo.png",
+  ];
+
+  // Auto-scroll to bottom when messages change
   useEffect(() => {
-    const models = webllm.prebuiltAppConfig.model_list
-      .filter((m) => m.model_id.toLowerCase().includes("vision"))
-      .map((m) => m.model_id);
-    setAvailableModels(models);
-    console.log("Available vision models:", models);
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, isThinking]);
+
+  // Detect WebGPU support
+  useEffect(() => {
+    if (typeof navigator !== "undefined" && "gpu" in navigator) {
+      setGpuSupported(true);
+    } else {
+      setGpuSupported(false);
+    }
   }, []);
 
-  const initializeEngine = async () => {
-    setIsLoading(true);
-    setProgress("Initializing Vision Model...");
-
-    try {
-      // Check WebGPU support
-      if (!navigator.gpu) {
-        throw new Error(
-          "WebGPU is not supported in this browser. Please use Chrome, Edge, or another WebGPU-enabled browser."
-        );
-      }
-
-      const initProgressCallback = (report: webllm.InitProgressReport) => {
-        setProgress(report.text);
-      };
-
-      // Try the q4f32_1 variant first (better compatibility)
-      // Then fall back to q4f16_1 if needed
-      let selectedModel = "Phi-3.5-vision-instruct-q4f32_1-MLC";
-
-      if (availableModels.length > 0) {
-        // Prefer f32 variant for better compatibility
-        const f32Model = availableModels.find((m) => m.includes("q4f32"));
-        selectedModel = f32Model || availableModels[0];
-        console.log("Using vision model:", selectedModel);
-      }
-
-      setProgress(`Loading ${selectedModel}...`);
-
-      const newEngine = await webllm.CreateMLCEngine(selectedModel, {
-        initProgressCallback,
+  // Worker setup
+  useEffect(() => {
+    if (!worker.current) {
+      worker.current = new Worker(new URL("./worker.ts", import.meta.url), {
+        type: "module",
       });
-
-      setEngine(newEngine);
-      setProgress("Vision model ready! 🎉");
-      setIsLoading(false);
-    } catch (error: any) {
-      console.error("Error initializing engine:", error);
-      const errorMessage =
-        error?.message || error?.toString() || "Unknown error";
-      setProgress(
-        `Error: ${errorMessage}\n\nTry refreshing the page or use a WebGPU-enabled browser (Chrome/Edge).`
-      );
-      setIsLoading(false);
+      worker.current.postMessage({ type: "check" });
     }
-  };
+
+    const onMessageReceived = (e: MessageEvent<any>) => {
+      switch (e.data.status) {
+        case "loading":
+          setStatus("loading");
+          setLoadingMessage(e.data.data);
+          break;
+        case "initiate":
+          setProgressItems((prev) => [...prev, e.data]);
+          break;
+        case "progress":
+          setProgressItems((prev) =>
+            prev.map((item) =>
+              item.file === e.data.file ? { ...item, ...e.data } : item
+            )
+          );
+          break;
+        case "done":
+          setProgressItems((prev) =>
+            prev.filter((item) => item.file !== e.data.file)
+          );
+          break;
+        case "ready":
+          setStatus("ready");
+          setLoadingMessage("");
+          setProgressItems([]);
+          break;
+        case "start":
+          setIsThinking(true);
+          setIsStreaming(false);
+          setMessages((prev) => [
+            ...prev,
+            { role: "assistant", content: [{ type: "text", text: "" }] },
+          ]);
+          break;
+        case "update": {
+          if (isThinking) setIsThinking(false);
+          setIsStreaming(true);
+          const { output, tps, numTokens } = e.data;
+          setTps(tps);
+          setNumTokens(numTokens);
+          setMessages((prev) => {
+            const cloned = [...prev];
+            const last = cloned.at(-1);
+            if (!last) return cloned;
+            const lastContent = last.content[0];
+            cloned[cloned.length - 1] = {
+              ...last,
+              role: "assistant",
+              content: [
+                {
+                  type: "text",
+                  text:
+                    lastContent.type === "text"
+                      ? (lastContent.text || "") + output
+                      : output,
+                },
+              ],
+            };
+            return cloned;
+          });
+          break;
+        }
+        case "complete":
+          setIsStreaming(false);
+          setIsThinking(false);
+          break;
+        case "error":
+          setIsStreaming(false);
+          setIsThinking(false);
+          setError(e.data.data);
+          break;
+      }
+    };
+
+    const onErrorReceived = (e: Event) => {
+      console.error("Worker error:", e);
+      setError("Worker encountered an error");
+    };
+
+    worker.current.addEventListener("message", onMessageReceived);
+    worker.current.addEventListener("error", onErrorReceived);
+
+    return () => {
+      if (worker.current) {
+        worker.current.removeEventListener("message", onMessageReceived);
+        worker.current.removeEventListener("error", onErrorReceived);
+      }
+    };
+  }, [isThinking]);
+
+  // Trigger generation on new user messages
+  useEffect(() => {
+    if (messages.length === 0) return;
+    if (messages.at(-1)?.role === "assistant") return;
+
+    if (worker.current) {
+      worker.current.postMessage({ type: "generate", data: messages });
+    }
+  }, [messages]);
 
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -75,187 +174,215 @@ export default function DescribePage() {
       const reader = new FileReader();
       reader.onloadend = () => {
         setSelectedImage(reader.result as string);
-        setDescription("");
       };
       reader.readAsDataURL(file);
     }
   };
 
-  const handleDescribe = async () => {
-    if (!engine || !selectedImage) return;
-
-    setIsDescribing(true);
-    setDescription("");
-
+  const handlePredefinedImage = async (url: string) => {
     try {
-      // Use vision model format with image content
-      const messages: webllm.ChatCompletionMessageParam[] = [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: prompt },
-            {
-              type: "image_url",
-              image_url: { url: selectedImage },
-            },
-          ],
-        },
-      ];
+      const proxyUrl = `/api/proxy-image?url=${encodeURIComponent(url)}`;
+      const response = await fetch(proxyUrl);
 
-      const chunks = await engine.chat.completions.create({
-        messages,
-        stream: true,
-      });
-
-      let fullResponse = "";
-      for await (const chunk of chunks) {
-        const content = chunk.choices[0]?.delta?.content || "";
-        fullResponse += content;
-        setDescription(fullResponse);
+      if (!response.ok) {
+        throw new Error("Failed to fetch image from proxy");
       }
-    } catch (error: any) {
-      console.error("Description error:", error);
-      const errorMsg = error?.message || "Unknown error";
-      setDescription(`Error: ${errorMsg}`);
-    } finally {
-      setIsDescribing(false);
+
+      const blob = await response.blob();
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        setSelectedImage(reader.result as string);
+      };
+      reader.readAsDataURL(blob);
+    } catch (error) {
+      console.error("Failed to load predefined image:", error);
+      setError("Failed to load the sample image. Please try uploading your own.");
     }
   };
 
+  const handleSendMessage = () => {
+    if ((!selectedImage && !inputText.trim()) || isStreaming) return;
+
+    const content: MessageContent[] = [];
+
+    if (selectedImage) {
+      content.push({ type: "image", image: selectedImage });
+    }
+
+    if (inputText.trim()) {
+      content.push({ type: "text", text: inputText });
+    }
+
+    setMessages((prev) => [...prev, { role: "user", content }]);
+    setInputText("");
+    setSelectedImage(null);
+    setTps(null);
+    setNumTokens(null);
+  };
+
+  const handleKeyPress = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleSendMessage();
+    }
+  };
+
+  const formatBytes = (bytes: number) => {
+    if (bytes === 0) return "0 B";
+    const k = 1024;
+    const sizes = ["B", "KB", "MB", "GB"];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return (bytes / Math.pow(k, i)).toFixed(2) + " " + sizes[i];
+  };
+
+  // SSR-safe placeholder
+  if (gpuSupported === null) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-gray-100 dark:bg-gray-900">
+        <p className="text-gray-500">Loading…</p>
+      </div>
+    );
+  }
+
+  if (!gpuSupported) {
+    return (
+      <div className="fixed w-screen h-screen flex justify-center items-center bg-black text-white text-2xl font-semibold">
+        WebGPU is not supported on this browser.
+      </div>
+    );
+  }
+
   return (
-    <div className="min-h-screen bg-gradient-to-b from-purple-50 to-white">
+    <div className="flex flex-col h-screen bg-gray-50">
       {/* Header */}
-      <header className="bg-white shadow-sm border-b border-gray-200">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <div className="text-3xl">🔍</div>
-              <h1 className="text-2xl font-semibold text-purple-600">
-                Image Describer
-              </h1>
-            </div>
-            <div className="text-sm text-gray-600 flex items-center gap-2">
-              <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></span>
-              Powered by Vision AI
-            </div>
+      <header className="bg-white shadow-sm border-b border-gray-200 flex-shrink-0">
+        <div className="max-w-5xl mx-auto py-3 px-4 sm:px-6 lg:px-8 flex justify-between items-center">
+          <h1 className="text-xl font-bold text-gray-900 flex items-center gap-2">
+            <svg
+              className="w-6 h-6 text-purple-600"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={2}
+                d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"
+              />
+            </svg>
+            SmolVLM Chat
+          </h1>
+          <div className="flex items-center gap-3">
+            <span className="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium bg-purple-100 text-purple-800">
+              <span className="relative flex h-2 w-2 mr-1.5">
+                <span
+                  className={`animate-ping absolute inline-flex h-full w-full rounded-full ${
+                    status === "ready" ? "bg-green-400" : "bg-red-400"
+                  } opacity-75`}
+                ></span>
+                <span
+                  className={`relative inline-flex rounded-full h-2 w-2 ${
+                    status === "ready" ? "bg-green-500" : "bg-red-500"
+                  }`}
+                ></span>
+              </span>
+              {status === "ready" ? "Ready" : "Loading"}
+            </span>
+            <Link
+              href="/"
+              className="text-gray-600 hover:text-purple-600 transition-colors text-sm font-medium"
+            >
+              ← Back
+            </Link>
           </div>
         </div>
       </header>
 
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        {!engine ? (
-          <div className="max-w-2xl mx-auto">
-            <div className="bg-white rounded-2xl shadow-lg p-8 text-center">
-              <div className="w-16 h-16 bg-purple-100 rounded-full flex items-center justify-center mx-auto mb-6">
-                <svg
-                  className="w-8 h-8 text-purple-600"
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"
-                  />
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"
-                  />
-                </svg>
-              </div>
-              <h2 className="text-2xl font-bold text-gray-900 mb-3">
-                Initialize Vision Model
-              </h2>
-              <p className="text-gray-600 mb-6 leading-relaxed">
-                First time setup will download the Vision AI model (~2-3GB).
-                This runs entirely in your browser with advanced image
-                understanding capabilities!
-              </p>
-              {availableModels.length > 0 && (
-                <div className="mb-4 p-3 bg-green-50 border border-green-200 rounded-lg text-sm">
-                  <p className="font-semibold text-green-800 mb-1">
-                    Available Vision Models:
-                  </p>
-                  {availableModels.map((model) => (
-                    <p key={model} className="text-green-700">
-                      {model}
-                    </p>
-                  ))}
-                </div>
-              )}
-              {availableModels.length === 0 && (
-                <div className="mb-4 p-3 bg-amber-50 border border-amber-200 rounded-lg text-sm text-amber-800">
-                  ⚠️ No vision models found in prebuilt config. Will attempt
-                  fallback.
-                </div>
-              )}
-              <button
-                onClick={initializeEngine}
-                disabled={isLoading}
-                className={`px-8 py-3 rounded-lg font-semibold text-white transition-all transform ${
-                  isLoading
-                    ? "bg-gray-400 cursor-not-allowed"
-                    : "bg-purple-600 hover:bg-purple-700 hover:scale-105 active:scale-95"
-                }`}
+      {/* Loading Screen */}
+      {(status === null || status === "loading") && (
+        <div className="flex-1 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl shadow-xl p-8 text-center max-w-md w-full">
+            <div className="flex justify-center mb-6">
+              <svg
+                className="w-16 h-16 text-purple-500"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
               >
-                {isLoading ? (
-                  <span className="flex items-center gap-2">
-                    <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24">
-                      <circle
-                        className="opacity-25"
-                        cx="12"
-                        cy="12"
-                        r="10"
-                        stroke="currentColor"
-                        strokeWidth="4"
-                        fill="none"
-                      />
-                      <path
-                        className="opacity-75"
-                        fill="currentColor"
-                        d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-                      />
-                    </svg>
-                    Loading...
-                  </span>
-                ) : (
-                  "Initialize Vision Model"
-                )}
-              </button>
-              {progress && (
-                <div className="mt-6 p-4 bg-purple-50 border border-purple-200 rounded-lg">
-                  <p className="text-sm text-purple-800">{progress}</p>
-                </div>
-              )}
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"
+                />
+              </svg>
             </div>
-          </div>
-        ) : (
-          <div className="space-y-6">
-            {/* Prompt Input */}
-            <div className="bg-white rounded-2xl shadow-lg p-6">
-              <label className="block text-sm font-medium text-gray-700 mb-2">
-                What would you like to know about the image?
-              </label>
-              <input
-                type="text"
-                value={prompt}
-                onChange={(e) => setPrompt(e.target.value)}
-                placeholder="e.g., Describe this image, What objects are in this picture?"
-                className="w-full px-4 py-3 bg-gray-50 border-2 border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent text-gray-900"
-              />
-            </div>
+            <h2 className="text-2xl font-bold text-gray-900 mb-3">
+              SmolVLM Vision Model
+            </h2>
+            <p className="text-gray-600 mb-6 leading-relaxed text-sm">
+              A lightweight 256M parameter vision-language model running locally
+              in your browser with WebGPU.
+            </p>
 
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-              {/* Image Upload Section */}
-              <div className="bg-white rounded-2xl shadow-lg overflow-hidden">
-                <div className="bg-gradient-to-r from-purple-500 to-pink-600 px-6 py-3">
-                  <h3 className="text-white font-semibold flex items-center gap-2">
+            {status === null ? (
+              <button
+                onClick={() => {
+                  if (worker.current) {
+                    worker.current.postMessage({ type: "load" });
+                    setStatus("loading");
+                  }
+                }}
+                className="px-8 py-3 rounded-lg font-semibold text-white bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 transition-all transform hover:scale-105 active:scale-95"
+              >
+                Load Model
+              </button>
+            ) : (
+              <div className="space-y-3">
+                <p className="text-sm text-purple-600 font-medium">
+                  {loadingMessage || "Initializing..."}
+                </p>
+                {progressItems.map((item, i) => (
+                  <div key={i} className="w-full">
+                    <div className="flex justify-between text-xs text-gray-500 mb-1">
+                      <span className="truncate max-w-[70%]">{item.file}</span>
+                      <span>
+                        {item.progress?.toFixed(0) || 0}%
+                        {item.total ? ` of ${formatBytes(item.total)}` : ""}
+                      </span>
+                    </div>
+                    <div className="w-full bg-gray-200 rounded-full h-2">
+                      <div
+                        className="bg-gradient-to-r from-purple-500 to-pink-500 h-2 rounded-full transition-all"
+                        style={{ width: `${item.progress || 0}%` }}
+                      ></div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {error && (
+              <div className="mt-4 p-4 bg-red-50 border border-red-200 rounded-lg">
+                <p className="text-sm text-red-800">{error}</p>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Chat Interface */}
+      {status === "ready" && (
+        <>
+          {/* Messages Area */}
+          <div className="flex-1 overflow-y-auto">
+            <div className="max-w-3xl mx-auto px-4 py-6">
+              {messages.length === 0 ? (
+                <div className="flex flex-col items-center justify-center h-full text-center py-12">
+                  <div className="w-16 h-16 bg-gradient-to-br from-purple-400 to-pink-400 rounded-2xl flex items-center justify-center mb-4">
                     <svg
-                      className="w-5 h-5"
+                      className="w-8 h-8 text-white"
                       fill="none"
                       stroke="currentColor"
                       viewBox="0 0 24 24"
@@ -267,186 +394,190 @@ export default function DescribePage() {
                         d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"
                       />
                     </svg>
-                    Upload Image
+                  </div>
+                  <h3 className="text-xl font-semibold text-gray-900 mb-2">
+                    Start a conversation
                   </h3>
+                  <p className="text-gray-600 mb-6 max-w-md">
+                    Upload an image and ask me anything about it. I can describe,
+                    analyze, and answer questions about visual content.
+                  </p>
+                  <div className="flex flex-wrap gap-2 justify-center">
+                    {predefinedImages.map((url, idx) => (
+                      <button
+                        key={idx}
+                        onClick={() => handlePredefinedImage(url)}
+                        className="px-4 py-2 text-sm bg-white border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 transition-colors"
+                      >
+                        Try Sample Image
+                      </button>
+                    ))}
+                  </div>
                 </div>
-                <div className="p-6">
-                  <div className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center hover:border-purple-400 transition-colors">
-                    {selectedImage ? (
-                      <div className="space-y-4">
-                        {/* eslint-disable-next-line @next/next/no-img-element */}
-                        <img
-                          src={selectedImage}
-                          alt="Uploaded"
-                          className="max-h-96 mx-auto rounded-lg shadow-md"
-                        />
-                        <label className="inline-block px-4 py-2 bg-purple-100 text-purple-700 rounded-lg cursor-pointer hover:bg-purple-200 transition-colors">
-                          Change Image
-                          <input
-                            type="file"
-                            accept="image/*"
-                            onChange={handleImageUpload}
-                            className="hidden"
-                          />
-                        </label>
+              ) : (
+                <div className="space-y-4">
+                  {messages.map((msg, idx) => (
+                    <div
+                      key={idx}
+                      className={`flex ${
+                        msg.role === "user" ? "justify-end" : "justify-start"
+                      }`}
+                    >
+                      <div
+                        className={`max-w-[85%] rounded-2xl px-4 py-3 ${
+                          msg.role === "user"
+                            ? "bg-gradient-to-br from-purple-600 to-pink-600 text-white"
+                            : "bg-white shadow-sm border border-gray-200 text-gray-900"
+                        }`}
+                      >
+                        {msg.content.map((c, ci) => {
+                          if (c.type === "image") {
+                            return (
+                              <img
+                                key={ci}
+                                src={c.image}
+                                alt="uploaded"
+                                className="rounded-lg max-w-sm w-full mb-2"
+                              />
+                            );
+                          } else {
+                            return (
+                              <p key={ci} className="whitespace-pre-wrap text-sm leading-relaxed">
+                                {c.text}
+                              </p>
+                            );
+                          }
+                        })}
                       </div>
-                    ) : (
-                      <label className="cursor-pointer">
-                        <div className="space-y-4">
-                          <svg
-                            className="w-16 h-16 mx-auto text-gray-400"
-                            fill="none"
-                            stroke="currentColor"
-                            viewBox="0 0 24 24"
-                          >
-                            <path
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                              strokeWidth={2}
-                              d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"
-                            />
-                          </svg>
-                          <div>
-                            <p className="text-lg font-medium text-gray-700">
-                              Click to upload an image
-                            </p>
-                            <p className="text-sm text-gray-500 mt-1">
-                              PNG, JPG, GIF up to 10MB
-                            </p>
+                    </div>
+                  ))}
+
+                  {isThinking && (
+                    <div className="flex justify-start">
+                      <div className="bg-white shadow-sm border border-gray-200 rounded-2xl px-4 py-3">
+                        <div className="flex items-center space-x-2">
+                          <div className="flex space-x-1">
+                            <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: "0ms" }}></span>
+                            <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: "150ms" }}></span>
+                            <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: "300ms" }}></span>
                           </div>
                         </div>
-                        <input
-                          type="file"
-                          accept="image/*"
-                          onChange={handleImageUpload}
-                          className="hidden"
-                        />
-                      </label>
-                    )}
-                  </div>
-                </div>
-              </div>
-
-              {/* Description Output */}
-              <div className="bg-white rounded-2xl shadow-lg overflow-hidden">
-                <div className="bg-gradient-to-r from-indigo-500 to-purple-600 px-6 py-3">
-                  <h3 className="text-white font-semibold flex items-center gap-2">
-                    <svg
-                      className="w-5 h-5"
-                      fill="none"
-                      stroke="currentColor"
-                      viewBox="0 0 24 24"
-                    >
-                      <path
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        strokeWidth={2}
-                        d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
-                      />
-                    </svg>
-                    Description
-                  </h3>
-                </div>
-                <div className="p-6">
-                  <div className="min-h-[400px] p-4 bg-indigo-50 border-2 border-indigo-200 rounded-lg overflow-auto">
-                    {description ? (
-                      <p className="text-gray-900 whitespace-pre-wrap leading-relaxed">
-                        {description}
-                      </p>
-                    ) : isDescribing ? (
-                      <div className="flex items-center gap-2 text-gray-600">
-                        <svg
-                          className="animate-spin h-5 w-5"
-                          viewBox="0 0 24 24"
-                        >
-                          <circle
-                            className="opacity-25"
-                            cx="12"
-                            cy="12"
-                            r="10"
-                            stroke="currentColor"
-                            strokeWidth="4"
-                            fill="none"
-                          />
-                          <path
-                            className="opacity-75"
-                            fill="currentColor"
-                            d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-                          />
-                        </svg>
-                        Analyzing image...
                       </div>
-                    ) : (
-                      <p className="text-gray-400">
-                        Upload an image and click &quot;Describe Image&quot; to
-                        see the AI description
-                      </p>
-                    )}
-                  </div>
-                </div>
-              </div>
-            </div>
+                    </div>
+                  )}
 
-            {/* Describe Button */}
-            <div className="text-center">
-              <button
-                onClick={handleDescribe}
-                disabled={isDescribing || !selectedImage}
-                className={`px-12 py-4 rounded-xl font-bold text-white text-lg transition-all transform shadow-lg ${
-                  isDescribing || !selectedImage
-                    ? "bg-gray-400 cursor-not-allowed"
-                    : "bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 hover:scale-105 active:scale-95 hover:shadow-xl"
-                }`}
-              >
-                {isDescribing ? (
-                  <span className="flex items-center gap-3">
-                    <svg className="animate-spin h-6 w-6" viewBox="0 0 24 24">
-                      <circle
-                        className="opacity-25"
-                        cx="12"
-                        cy="12"
-                        r="10"
-                        stroke="currentColor"
-                        strokeWidth="4"
-                        fill="none"
-                      />
-                      <path
-                        className="opacity-75"
-                        fill="currentColor"
-                        d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-                      />
-                    </svg>
-                    Analyzing...
-                  </span>
-                ) : (
-                  <span className="flex items-center gap-2">
-                    <svg
-                      className="w-6 h-6"
-                      fill="none"
-                      stroke="currentColor"
-                      viewBox="0 0 24 24"
-                    >
-                      <path
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        strokeWidth={2}
-                        d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"
-                      />
-                      <path
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        strokeWidth={2}
-                        d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"
-                      />
-                    </svg>
-                    Describe Image
-                  </span>
-                )}
-              </button>
+                  {isStreaming && tps && (
+                    <div className="flex justify-start">
+                      <div className="text-xs text-gray-500 px-4">
+                        {tps.toFixed(1)} tok/s • {numTokens} tokens
+                      </div>
+                    </div>
+                  )}
+
+                  <div ref={messagesEndRef} />
+                </div>
+              )}
             </div>
           </div>
-        )}
-      </main>
+
+          {/* Input Area */}
+          <div className="border-t border-gray-200 bg-white flex-shrink-0">
+            <div className="max-w-3xl mx-auto p-4">
+              {/* Image Preview */}
+              {selectedImage && (
+                <div className="mb-3 relative inline-block">
+                  <img
+                    src={selectedImage}
+                    alt="To upload"
+                    className="h-20 w-20 object-cover rounded-lg border-2 border-purple-300"
+                  />
+                  <button
+                    onClick={() => setSelectedImage(null)}
+                    className="absolute -top-2 -right-2 bg-red-500 text-white rounded-full w-6 h-6 flex items-center justify-center hover:bg-red-600 transition-colors"
+                  >
+                    ×
+                  </button>
+                </div>
+              )}
+
+              {/* Input Box */}
+              <div className="flex items-end gap-2">
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/*"
+                  onChange={handleImageUpload}
+                  className="hidden"
+                />
+
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={isStreaming}
+                  className="flex-shrink-0 p-3 rounded-lg bg-gray-100 hover:bg-gray-200 text-gray-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  title="Attach image"
+                >
+                  <svg
+                    className="w-5 h-5"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"
+                    />
+                  </svg>
+                </button>
+
+                <textarea
+                  value={inputText}
+                  onChange={(e) => setInputText(e.target.value)}
+                  onKeyPress={handleKeyPress}
+                  placeholder="Ask about an image..."
+                  disabled={isStreaming}
+                  className="flex-1 resize-none rounded-lg border border-gray-300 px-4 py-3 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed max-h-32"
+                  rows={1}
+                  style={{
+                    minHeight: "44px",
+                    height: "auto",
+                  }}
+                  onInput={(e) => {
+                    const target = e.target as HTMLTextAreaElement;
+                    target.style.height = "44px";
+                    target.style.height = target.scrollHeight + "px";
+                  }}
+                />
+
+                <button
+                  onClick={handleSendMessage}
+                  disabled={(!selectedImage && !inputText.trim()) || isStreaming}
+                  className="flex-shrink-0 p-3 rounded-lg bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 text-white disabled:opacity-50 disabled:cursor-not-allowed transition-all transform hover:scale-105 active:scale-95"
+                >
+                  <svg
+                    className="w-5 h-5"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"
+                    />
+                  </svg>
+                </button>
+              </div>
+
+              <p className="text-xs text-gray-500 mt-2 text-center">
+                Press Enter to send, Shift+Enter for new line
+              </p>
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }
